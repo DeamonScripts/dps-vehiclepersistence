@@ -238,6 +238,6 @@ This resource is provided for use on DPSRP servers. Feel free to modify for your
 
 ## Credits
 
-- DPSRP Development Team
+- DaemonAlex
 - QBCore Framework
 - Overextended (ox_lib, oxmysql)

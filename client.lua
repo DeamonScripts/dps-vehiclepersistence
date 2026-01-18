@@ -4,7 +4,12 @@
 
 local currentVehicle = nil
 local lastVehicle = nil
+local lastVehicleCoords = nil  -- Cache last vehicle position
 local isOwner = false
+
+-- Ownership cache to prevent DB spam
+local ownershipCache = {}
+local OWNERSHIP_CACHE_DURATION = 30000  -- Default 30 seconds, overridden by Config
 
 -- Tiered throttling system
 local ThrottleTiers = {
@@ -14,7 +19,7 @@ local ThrottleTiers = {
     DISTANT = 5000      -- >100m from all tracked vehicles
 }
 
--- Get dynamic wait interval based on player state
+-- Get dynamic wait interval based on player state (OPTIMIZED)
 local function GetThrottleInterval()
     local ped = PlayerPedId()
     local playerCoords = GetEntityCoords(ped)
@@ -27,6 +32,7 @@ local function GetThrottleInterval()
     -- Check distance to last vehicle (just exited)
     if lastVehicle and DoesEntityExist(lastVehicle) then
         local vehCoords = GetEntityCoords(lastVehicle)
+        lastVehicleCoords = vehCoords  -- Cache for optimization
         local dist = #(playerCoords - vehCoords)
 
         if dist < 10.0 then
@@ -36,7 +42,19 @@ local function GetThrottleInterval()
         end
     end
 
-    -- Check for any nearby vehicles in game pool
+    -- OPTIMIZATION: If we have a cached lastVehicleCoords and player is far from it,
+    -- skip the expensive GetGamePool scan and default to WALKING tier
+    if lastVehicleCoords then
+        local distToLast = #(playerCoords - lastVehicleCoords)
+        if distToLast > 20.0 then
+            -- Player is far from their last known vehicle
+            -- No need to scan all vehicles in city - use WALKING tier
+            return ThrottleTiers.WALKING
+        end
+    end
+
+    -- Only scan game pool if player might be near a tracked vehicle
+    -- (either no lastVehicle or within 20m of last known position)
     local vehicles = GetGamePool('CVehicle')
     local closestDist = 999.0
 
@@ -46,6 +64,10 @@ local function GetThrottleInterval()
             local dist = #(playerCoords - vehCoords)
             if dist < closestDist then
                 closestDist = dist
+            end
+            -- Early exit if we find something close
+            if closestDist < 10.0 then
+                break
             end
         end
     end
@@ -100,10 +122,48 @@ local function GetVehicleFuel(vehicle)
     return GetVehicleFuelLevel(vehicle)
 end
 
--- Check if player owns this vehicle using server callback
+-- Check if player owns this vehicle using server callback (WITH CACHING)
 local function IsVehicleOwner(vehicle, plate)
+    -- Get cache duration from config or use default
+    local cacheDuration = (Config.OwnershipCacheDuration or 30) * 1000
+
+    -- Check cache first
+    local cached = ownershipCache[plate]
+    if cached then
+        local age = GetGameTimer() - cached.timestamp
+        if age < cacheDuration then
+            if Config.Debug then
+                print('[dps-vehiclepersistence] Ownership cache hit for: ' .. plate .. ' (owned: ' .. tostring(cached.owned) .. ')')
+            end
+            return cached.owned
+        else
+            -- Cache expired, remove it
+            ownershipCache[plate] = nil
+        end
+    end
+
+    -- Cache miss - query server
     local owned = lib.callback.await('dps-vehiclepersistence:checkOwnership', false, plate)
-    return owned or false
+    owned = owned or false
+
+    -- Store in cache
+    ownershipCache[plate] = {
+        owned = owned,
+        timestamp = GetGameTimer()
+    }
+
+    if Config.Debug then
+        print('[dps-vehiclepersistence] Ownership cache miss for: ' .. plate .. ' (owned: ' .. tostring(owned) .. ')')
+    end
+
+    return owned
+end
+
+-- Clear ownership cache for a specific plate (call when ownership changes)
+local function ClearOwnershipCache(plate)
+    if plate then
+        ownershipCache[plate] = nil
+    end
 end
 
 -- Alternative ownership check using ox_inventory vehicle keys (fallback)
@@ -118,7 +178,11 @@ end
 -- GARAGE SPAWN TRACKING (forward declarations)
 -- ============================================
 local garageSpawnedVehicles = {}
-local GARAGE_SPAWN_GRACE_PERIOD = 5000 -- 5 seconds
+
+-- Get grace period from config (default 10 seconds for high-ping servers)
+local function GetGarageGracePeriod()
+    return Config.GarageSpawnGracePeriod or 10000
+end
 
 -- Check if vehicle was recently spawned from garage (skip persistence save)
 local function IsGarageSpawned(vehicle)
@@ -126,7 +190,8 @@ local function IsGarageSpawned(vehicle)
     local netId = NetworkGetNetworkIdFromEntity(vehicle)
     local data = garageSpawnedVehicles[netId]
     if data then
-        if GetGameTimer() - data.spawnTime < GARAGE_SPAWN_GRACE_PERIOD then
+        local gracePeriod = GetGarageGracePeriod()
+        if GetGameTimer() - data.spawnTime < gracePeriod then
             return true
         else
             -- Grace period expired, remove from tracking
@@ -691,8 +756,8 @@ RegisterNetEvent('dps-vehiclepersistence:towNearestVehicle', function()
     end
 end)
 
--- Track vehicles we've already requested props for
-local propsRequested = {}
+-- NOTE: propsRequested is declared earlier at line ~380 (garage integration section)
+-- Removed duplicate declaration here
 
 -- Render distance thresholds for prop application
 local RenderDistances = {
@@ -811,6 +876,101 @@ CreateThread(function()
                 end
             end
         end
+    end
+end)
+
+-- ═══════════════════════════════════════════════════════
+-- DSRP JOB VEHICLE INTEGRATION
+-- Auto-exclude vehicles spawned by job scripts
+-- ═══════════════════════════════════════════════════════
+
+-- Helper to exclude job-spawned vehicle
+local function ExcludeJobVehicle(vehicle, plate, source)
+    if not vehicle or not DoesEntityExist(vehicle) then return end
+
+    plate = plate or GetVehicleNumberPlateText(vehicle)
+    plate = string.gsub(plate, "^%s*(.-)%s*$", "%1")
+
+    local reason = Config.JobVehicleExclusion and Config.JobVehicleExclusion.reason or 'job-vehicle'
+    TriggerServerEvent('dps-vehiclepersistence:excludeVehicle', plate, source or reason)
+
+    if Config.Debug then
+        print('[dps-vehiclepersistence] Job vehicle excluded: ' .. plate .. ' (source: ' .. (source or reason) .. ')')
+    end
+end
+
+-- Register job vehicle spawn event listeners dynamically from config
+CreateThread(function()
+    Wait(1000) -- Wait for config to load
+
+    if not Config.JobVehicleExclusion or not Config.JobVehicleExclusion.enabled then
+        return
+    end
+
+    local events = Config.JobVehicleExclusion.spawnEvents or {}
+
+    for _, eventName in ipairs(events) do
+        RegisterNetEvent(eventName, function(vehicleOrData, plate)
+            Wait(500) -- Wait for vehicle to spawn
+
+            local vehicle = nil
+
+            -- Handle different event data formats
+            if type(vehicleOrData) == 'number' then
+                -- Direct vehicle entity passed
+                vehicle = vehicleOrData
+            elseif type(vehicleOrData) == 'table' and vehicleOrData.plate then
+                -- Data table with plate
+                plate = vehicleOrData.plate
+                vehicle = FindVehicleByPlate(plate)
+            else
+                -- Try to find vehicle player is in
+                local ped = PlayerPedId()
+                vehicle = GetVehiclePedIsIn(ped, false)
+                if vehicle == 0 then
+                    vehicle = GetLastVehiclePedWasIn(ped)
+                end
+            end
+
+            if vehicle and DoesEntityExist(vehicle) then
+                ExcludeJobVehicle(vehicle, plate, eventName)
+            end
+        end)
+
+        if Config.Debug then
+            print('[dps-vehiclepersistence] Registered job exclusion listener: ' .. eventName)
+        end
+    end
+end)
+
+-- Direct DSRP Police Job integration (common patterns)
+RegisterNetEvent('dps-policejob:client:VehicleSpawned', function(vehicle, plate)
+    if vehicle and DoesEntityExist(vehicle) then
+        ExcludeJobVehicle(vehicle, plate, 'dps-policejob')
+    end
+end)
+
+RegisterNetEvent('dps-ambulancejob:client:VehicleSpawned', function(vehicle, plate)
+    if vehicle and DoesEntityExist(vehicle) then
+        ExcludeJobVehicle(vehicle, plate, 'dps-ambulancejob')
+    end
+end)
+
+-- QBCore police job vehicle spawn
+RegisterNetEvent('qb-policejob:client:VehicleSpawned', function(vehData)
+    Wait(500)
+    local ped = PlayerPedId()
+    local vehicle = GetVehiclePedIsIn(ped, false)
+    if vehicle and vehicle ~= 0 then
+        local plate = vehData and vehData.plate or GetVehicleNumberPlateText(vehicle)
+        ExcludeJobVehicle(vehicle, plate, 'qb-policejob')
+    end
+end)
+
+-- Clear ownership cache when vehicle is sold/transferred
+RegisterNetEvent('vehiclekeys:client:SetOwner', function(plate)
+    if plate then
+        ClearOwnershipCache(plate)
     end
 end)
 

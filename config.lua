@@ -39,6 +39,15 @@ Config.MinStationaryTime = 30
 -- Spawn delay between vehicles on restart (ms)
 Config.SpawnDelay = 500
 
+-- Grace period after garage spawn before persistence kicks in (ms)
+-- Prevents saving vehicles player just spawned but hasn't entered yet
+-- Increase if you have high ping/server load
+Config.GarageSpawnGracePeriod = 10000  -- 10 seconds (was hardcoded 5s)
+
+-- Ownership check cache duration (seconds)
+-- Prevents DB spam when hopping in/out of vehicles repeatedly
+Config.OwnershipCacheDuration = 30
+
 -- ═══════════════════════════════════════════════════════
 -- GARAGE PROXIMITY (Optional)
 -- ═══════════════════════════════════════════════════════
@@ -155,3 +164,33 @@ Config.TowJobs = {
 -- ═══════════════════════════════════════════════════════
 
 Config.FuelResource = 'auto'  -- 'auto', 'ox_fuel', 'LegacyFuel', 'cdn-fuel', 'ps-fuel', 'native'
+
+-- ═══════════════════════════════════════════════════════
+-- DSRP JOB INTEGRATION
+-- Vehicles spawned by these job scripts are auto-excluded
+-- ═══════════════════════════════════════════════════════
+
+Config.JobVehicleExclusion = {
+    enabled = true,
+
+    -- Job vehicle spawn events to listen for (auto-exclude from persistence)
+    spawnEvents = {
+        -- DSRP Police Job
+        'dps-policejob:client:SpawnVehicle',
+        'police:client:SpawnVehicle',
+
+        -- DSRP EMS Job
+        'dps-ambulancejob:client:SpawnVehicle',
+        'ambulance:client:SpawnVehicle',
+
+        -- QB Police/EMS
+        'qb-policejob:client:spawnVehicle',
+        'qb-ambulancejob:client:spawnVehicle',
+
+        -- Generic patterns
+        'job:client:spawnVehicle',
+    },
+
+    -- Exclusion reason logged
+    reason = 'job-vehicle'
+}

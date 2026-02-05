@@ -5,7 +5,7 @@
 CREATE TABLE IF NOT EXISTS `dps_world_vehicles` (
     `id` INT AUTO_INCREMENT PRIMARY KEY,
     `plate` VARCHAR(8) NOT NULL,
-    `citizenid` VARCHAR(50) NOT NULL,
+    `citizenid` VARCHAR(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
     `model` VARCHAR(50) NOT NULL,
     `coords` LONGTEXT NOT NULL,
     `heading` FLOAT NOT NULL,
@@ -17,4 +17,4 @@ CREATE TABLE IF NOT EXISTS `dps_world_vehicles` (
     UNIQUE KEY `plate_unique` (`plate`),
     INDEX `idx_citizenid` (`citizenid`),
     INDEX `idx_saved_at` (`saved_at`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
